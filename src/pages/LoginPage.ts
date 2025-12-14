@@ -1,22 +1,9 @@
 // src/pages/LoginPage.ts
-/**
- * 목적:
- * - /login 페이지에서 "환급 CTA OR 카카오" 랜덤 진입을 처리하고,
- *   카카오 로그인 페이지(accounts.kakao.com/login) 도달까지 대기한다.
- * - Kakao 엔트리는 A/B 테스트나 UI 버전에 따라 구조가 달라질 수 있으므로,
- *   여러 locator 후보를 OR로 묶어서 안정적으로 탐색한다.
- */
 
 import { expect, type Locator, type Page } from '@playwright/test';
 import { getLoginUrl } from '../config/env';
-import {
-  KAKAO_LOGO_SRC_PART,
-  refundEntryCandidates,
-} from '../utils/locators';
-import {
-  KAKAO_ACCOUNTS_LOGIN_RE,
-  isKakaoAccountsLoginUrl,
-} from '../utils/kakao-url';
+import { kakaoEntryCandidates, refundEntryCandidates } from '../utils/locators';
+import { KAKAO_ACCOUNTS_LOGIN_RE, isKakaoAccountsLoginUrl } from '../utils/kakao-url';
 
 export type EntryType = 'kakao' | 'refund';
 
@@ -30,123 +17,142 @@ export type KakaoNavResult = {
 export class LoginPage {
   constructor(private readonly page: Page) {}
 
-  /** /login 진입 */
   async goto(): Promise<void> {
     await this.page.goto(getLoginUrl(), { waitUntil: 'domcontentloaded' });
   }
 
-  /**
-   * Kakao 엔트리 후보:
-   * - 버튼 텍스트에 "카카오/카카오톡/카톡"이 포함된 버튼
-   * - data-provider="kakao" 속성이 있는 요소
-   * - href에 kauth/ accounts.kakao.com 이 포함된 링크
-   * - Kakao 로고 이미지가 포함된 버튼/링크
-   *
-   * 여러 버전(A/B 테스트, UI 개편 등)을 흡수하기 위해 OR로 묶는다.
-   */
   private kakaoCandidates(): Locator {
-    const { page } = this;
-
-    const byRoleText = page.getByRole('button', {
-      name: /카카오|카카오톡|카톡/i,
-    });
-
-    const byDataAttr = page.locator('[data-provider="kakao"]');
-
-    const byHref = page.locator(
-      'a[href*="kauth.kakao.com"], a[href*="accounts.kakao.com"]',
-    );
-
-    const byLogoImg = page.locator(
-      `button:has(img[src*="${KAKAO_LOGO_SRC_PART}"]), a:has(img[src*="${KAKAO_LOGO_SRC_PART}"])`,
-    );
-
-    return byRoleText.or(byDataAttr).or(byHref).or(byLogoImg);
+    return kakaoEntryCandidates(this.page);
   }
 
-  /** 환급 CTA 후보 (구조 기반) */
   private refundCandidates(): Locator {
     return refundEntryCandidates(this.page);
   }
 
-  /** 가장 큰 버튼(넓이 기준)을 선택 */
-  private async pickLargest(candidates: Locator): Promise<Locator> {
-    const count = await candidates.count();
-    if (count === 0) {
-      throw new Error('환급 CTA 후보가 없습니다.');
-    }
+  /**
+   * "/login" 상단에 노출될 수 있는
+   * "예상 환급액 계산 기준" 모달이 떠 있으면 닫는다.
+   *
+   * - 모달이 늦게 뜨는 경우를 대비해 짧게 polling 한다.
+   * - 실패해도 예외를 던지지 않고 조용히 넘어간다(헬스체크/로그인 공통 사용).
+   */
+  async closeExpectedRefundInfoIfOpen(maxWaitMs = 5000): Promise<void> {
+    const dialog = this.page.getByRole('dialog', {
+      name: /예상 환급액 계산 기준/i,
+    });
+    const confirmButton = this.page.getByRole('button', { name: '확인' });
 
-    let largestIndex = 0;
-    let largestArea = 0;
+    const start = Date.now();
 
-    for (let i = 0; i < count; i++) {
-      const el = candidates.nth(i);
-      const box = await el.boundingBox();
-      if (!box) continue;
-
-      const area = box.width * box.height;
-      if (area > largestArea) {
-        largestArea = area;
-        largestIndex = i;
+    while (Date.now() - start < maxWaitMs) {
+      let count = 0;
+      try {
+        count = await dialog.count();
+      } catch {
+        count = 0;
       }
-    }
 
-    return candidates.nth(largestIndex);
+      if (count > 0) {
+        const first = dialog.first();
+        const visible = await first.isVisible().catch(() => false);
+
+        if (visible) {
+          try {
+            await confirmButton.click();
+            await first
+              .waitFor({ state: 'hidden', timeout: 3000 })
+              .catch(() => {});
+          } catch {
+            // 모달이 닫히지 않아도 여기서 예외는 삼킨다.
+          }
+          break;
+        }
+      }
+
+      // 아직 모달이 안 뜬 경우 잠깐 대기 후 다시 확인
+      await this.page.waitForTimeout(200);
+    }
   }
 
-  /**
-   * 어떤 Locator를 클릭하면 카카오 로그인으로 이동하는지 불확실할 때:
-   * - popup(새창) / same-tab(현재 탭) 두 경로를 동시에 대기한다.
-   * - waitForURL에는 waitUntil: 'load'를 사용해 페이지 로드까지 기다린다.
-   */
+  private async pickLargest(locator: Locator): Promise<Locator> {
+    const count = await locator.count();
+    if (count <= 1) return locator.first();
+
+    const index = await locator.evaluateAll((els) => {
+      let bestIdx = 0;
+      let bestArea = -1;
+      for (let i = 0; i < els.length; i++) {
+        const r = els[i].getBoundingClientRect();
+        const area = r.width * r.height;
+        if (area > bestArea) {
+          bestArea = area;
+          bestIdx = i;
+        }
+      }
+      return bestIdx;
+    });
+
+    return locator.nth(index);
+  }
+
   private async clickAndWaitForKakaoLogin(
     target: Locator,
   ): Promise<{ mode: 'same-tab' | 'popup'; kakaoPage: Page }> {
-    const popupPromise = this.page
-      .waitForEvent('popup', { timeout: 5_000 })
-      .then((p) => ({ mode: 'popup' as const, kakaoPage: p }))
-      .catch(() => null);
+    const page = this.page;
 
-    const sameTabPromise = this.page
-      .waitForURL(KAKAO_ACCOUNTS_LOGIN_RE, {
-        timeout: 15_000,
-        waitUntil: 'load',
-      })
-      .then(() => ({ mode: 'same-tab' as const, kakaoPage: this.page }))
-      .catch(() => null);
+    const popupPromise = page.waitForEvent('popup', { timeout: 10_000 }).then(
+      async (popup) => {
+        await popup.waitForURL(KAKAO_ACCOUNTS_LOGIN_RE, {
+          timeout: 10_000,
+          waitUntil: 'load',
+        });
+        return { mode: 'popup' as const, kakaoPage: popup };
+      },
+      () => null,
+    );
 
-    await target.click({ noWaitAfter: true });
+    const sameTabPromise = (async () => {
+      await Promise.all([
+        page.waitForURL(KAKAO_ACCOUNTS_LOGIN_RE, {
+          timeout: 10_000,
+          waitUntil: 'load',
+        }),
+        target.click(),
+      ]);
 
-    const firstHit = await Promise.race([popupPromise, sameTabPromise]);
+      return { mode: 'same-tab' as const, kakaoPage: page };
+    })();
 
-    if (firstHit?.mode === 'popup') {
-      await firstHit.kakaoPage.waitForURL(KAKAO_ACCOUNTS_LOGIN_RE, {
-        timeout: 15_000,
-        waitUntil: 'load',
-      });
+    const firstHit =
+      (await Promise.race([popupPromise, sameTabPromise])) ?? undefined;
+
+    if (firstHit?.mode === 'popup' || firstHit?.mode === 'same-tab') {
       return firstHit;
     }
 
-    if (firstHit?.mode === 'same-tab') {
-      return firstHit;
-    }
+    await page.waitForURL(KAKAO_ACCOUNTS_LOGIN_RE, {
+      timeout: 5000,
+      waitUntil: 'load',
+    });
 
-    throw new Error('카카오 로그인 페이지로의 내비게이션을 감지하지 못했습니다.');
+    return { mode: 'same-tab', kakaoPage: page };
   }
 
   /**
-   * 요구사항:
-   * - "환급금 OR 카카오" 랜덤 노출 → 클릭 → 카카오 로그인 페이지(accounts.kakao.com/login) 도달까지
-   * - Kakao 엔트리는 여러 버전이 존재할 수 있으므로 kakaoCandidates()로 통합 관리한다.
+   * 환급/카카오 엔트리 중 하나를 클릭하고 카카오 로그인 페이지까지 이동한다.
+   * - 진입 전 모달("예상 환급액 계산 기준")을 최대 5초 동안 감시/닫는다.
+   * - 우선 카카오 엔트리, 없으면 가장 큰 환급 CTA를 선택한다.
    */
   async clickEntryAndGoToKakaoLogin(): Promise<KakaoNavResult> {
     const kakao = this.kakaoCandidates();
     const refund = this.refundCandidates();
 
-    // 둘 중 하나라도 나타나면 진행 (숨겨진 요소가 많으므로 or 집합의 first 기준)
+    // 모달이 늦게 뜨는 경우까지 포함해서 한 번 정리
+    await this.closeExpectedRefundInfoIfOpen();
+
+    // 둘 중 하나라도 나타나면 진행
     await expect(kakao.or(refund).first()).toBeVisible();
 
-    // 1) 첫 클릭 타겟 결정
     let entryClicked: EntryType;
     let firstTarget: Locator;
 
@@ -158,21 +164,24 @@ export class LoginPage {
       firstTarget = await this.pickLargest(refund);
     }
 
-    // 2) 클릭 후 카카오 로그인 페이지 대기
-    let nav = await this.clickAndWaitForKakaoLogin(firstTarget);
+    const nav = await this.clickAndWaitForKakaoLogin(firstTarget);
     let kakaoUrl = nav.kakaoPage.url();
 
-    // 3) refund를 눌렀는데 아직 카카오 URL이 아니라면, Kakao 엔트리를 다시 탐색 후 1회 추가 시도
-    if (!isKakaoAccountsLoginUrl(kakaoUrl)) {
-      const kakaoAgain = this.kakaoCandidates();
-      if ((await kakaoAgain.count()) > 0) {
-        nav = await this.clickAndWaitForKakaoLogin(kakaoAgain.first());
-        kakaoUrl = nav.kakaoPage.url();
+    if (!isKakaoAccountsLoginUrl(kakaoUrl) && entryClicked === 'refund') {
+      const retryKakao = this.kakaoCandidates();
+      if ((await retryKakao.count()) > 0) {
         entryClicked = 'kakao';
+
+        const retryNav = await this.clickAndWaitForKakaoLogin(
+          retryKakao.first(),
+        );
+        kakaoUrl = retryNav.kakaoPage.url();
+
+        nav.mode = retryNav.mode;
+        nav.kakaoPage = retryNav.kakaoPage;
       }
     }
 
-    // 최종 검증
     expect(
       isKakaoAccountsLoginUrl(kakaoUrl),
       `카카오 로그인 URL 도달 실패: 현재 URL=${kakaoUrl}`,
